@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# MASJON BOT - نسخة تعمل على RENDER
+# MASJON BOT - نسخة محسنة (اتصال مرة واحدة فقط)
 
 import json
 import asyncio
@@ -11,7 +11,6 @@ import threading
 import requests
 import logging
 import os
-import sys
 from datetime import datetime, timedelta
 import jwt as pyjwt
 import urllib3
@@ -28,7 +27,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.ERROR)  # تغيير إلى ERROR فقط
 
 # ----------------------------------------
 JWT_UPDATE_INTERVAL = 600
@@ -49,19 +48,6 @@ _clis = []
 _masjon_tasks = {}
 _loop = None
 _accounts_loaded = False
-
-# متغيرات للتشغيل على Render
-_gunicorn_worker = False
-_initialized = False
-
-def is_gunicorn():
-    """التحقق إذا كنا نعمل تحت Gunicorn"""
-    return 'gunicorn' in os.environ.get('SERVER_SOFTWARE', '')
-
-def silent_print(message, force=False):
-    """طباعة فقط إذا كانت force=True"""
-    if force:
-        print(message, flush=True)
 
 # ========================================
 # دوال JWT
@@ -154,42 +140,33 @@ def get_jwt_token():
             _current_jwt_token = cached_jwt
         return cached_jwt
     
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        token = loop.run_until_complete(extract_new_jwt())
-        loop.close()
-        return token
-    except:
-        return None
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    token = loop.run_until_complete(extract_new_jwt())
+    loop.close()
+    return token
 
 def refresh_jwt_if_needed(response_status, force=False):
     if force or response_status == 401:
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            new_token = loop.run_until_complete(extract_new_jwt())
-            loop.close()
-            return new_token is not None
-        except:
-            return False
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        new_token = loop.run_until_complete(extract_new_jwt())
+        loop.close()
+        return new_token is not None
     return True
 
 def start_jwt_refresh_thread():
     def refresh_loop():
         while True:
             time.sleep(JWT_UPDATE_INTERVAL)
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(extract_new_jwt())
-                loop.close()
-            except:
-                pass
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(extract_new_jwt())
+            loop.close()
     threading.Thread(target=refresh_loop, daemon=True).start()
 
 # ----------------------------------------
-# دوال التشفير (مختصرة)
+# دوال التشفير
 # ----------------------------------------
 def encrypt_id(player_id):
     result = []
@@ -428,7 +405,156 @@ async def do_login(u, p, session):
     return auth, k, iv, ip, port, ip2, port2
 
 # ----------------------------------------
-# حسابات الهجوم
+# دوال API
+# ----------------------------------------
+def get_headers():
+    current_jwt = get_jwt_token()
+    if not current_jwt:
+        raise Exception("JWT token not available")
+    
+    return {
+        "Authorization": f"Bearer {current_jwt}",
+        "X-Unity-Version": "2018.4.11f1",
+        "X-GA": "v1 1",
+        "ReleaseVersion": GAME_VERSION,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Dalvik/2.1.0 (Linux; Android 9)",
+        "Connection": "close",
+    }
+
+def request_add_friend(player_id):
+    for attempt in range(3):
+        token = get_jwt_token()
+        if not token:
+            return "Error: لا يمكن الحصول على توكن"
+        
+        try:
+            encrypted_id = encrypt_id(player_id)
+            payload = f"08a7c4839f1e10{encrypted_id}1801"
+            payload_bytes = bytes.fromhex(encrypt_api(payload))
+
+            url = "https://clientbp.ggpolarbear.com/RequestAddingFriend"
+            headers = get_headers()
+            headers["Content-Length"] = str(len(payload_bytes))
+            
+            response = requests.post(url, headers=headers, data=payload_bytes, timeout=30)
+            
+            if response.status_code == 200:
+                return True
+            elif response.status_code == 401:
+                refresh_jwt_if_needed(401, force=True)
+                continue
+            else:
+                return f"Error: {response.status_code}"
+        except Exception as e:
+            if attempt == 2:
+                return f"Error: {str(e)}"
+            continue
+    
+    return "Error: فشل"
+
+def remove_friend(uid):
+    for attempt in range(3):
+        token = get_jwt_token()
+        if not token:
+            return "Error: لا يمكن الحصول على توكن"
+        
+        try:
+            encrypted_id = encrypt_id(uid)
+            payload = f"08a7c4839f1e10{encrypted_id}1801"
+            payload_bytes = bytes.fromhex(encrypt_api(payload))
+
+            url = "https://clientbp.ggblueshark.com/RemoveFriend"
+            headers = get_headers()
+            headers["Content-Length"] = str(len(payload_bytes))
+            
+            response = requests.post(url, headers=headers, data=payload_bytes, timeout=30)
+            
+            if response.status_code == 200:
+                return True
+            elif response.status_code == 401:
+                refresh_jwt_if_needed(401, force=True)
+                continue
+            else:
+                return f"Error: {response.status_code}"
+        except Exception as e:
+            if attempt == 2:
+                return f"Error: {str(e)}"
+            continue
+    
+    return "Error: فشل"
+
+# ----------------------------------------
+# الأصدقاء المؤقتين
+# ----------------------------------------
+def save_temp_friend(uid):
+    try:
+        with open(users_file, "r") as f:
+            data = json.load(f)
+    except:
+        data = {"friends": []}
+    
+    expiry_time = datetime.now() + timedelta(hours=3)
+    
+    data["friends"].append({
+        "uid": uid,
+        "added_time": datetime.now().isoformat(),
+        "expiry_time": expiry_time.isoformat(),
+        "expiry_timestamp": expiry_time.timestamp()
+    })
+    
+    with open(users_file, "w") as f:
+        json.dump(data, f, indent=4)
+    
+    return expiry_time
+
+def get_all_active_friends():
+    try:
+        with open(users_file, "r") as f:
+            data = json.load(f)
+        
+        active_friends = []
+        current_time = datetime.now().timestamp()
+        
+        for friend in data.get("friends", []):
+            if current_time < friend["expiry_timestamp"]:
+                active_friends.append(friend)
+        
+        return active_friends
+    except:
+        return []
+
+def delete_expired_friends():
+    try:
+        with open(users_file, "r") as f:
+            data = json.load(f)
+        
+        current_time = datetime.now().timestamp()
+        active_friends = []
+        
+        for friend in data.get("friends", []):
+            if current_time >= friend["expiry_timestamp"]:
+                remove_friend(friend["uid"])
+            else:
+                active_friends.append(friend)
+        
+        data["friends"] = active_friends
+        with open(users_file, "w") as f:
+            json.dump(data, f, indent=4)
+        
+        return True
+    except Exception as e:
+        return False
+
+def auto_delete_scheduler():
+    def delete_loop():
+        while True:
+            time.sleep(60)
+            delete_expired_friends()
+    threading.Thread(target=delete_loop, daemon=True).start()
+
+# ----------------------------------------
+# حسابات الهجوم (اتصال مرة واحدة فقط)
 # ----------------------------------------
 class AsyncCli:
     def __init__(self, u, p):
@@ -436,128 +562,76 @@ class AsyncCli:
         self.p = p
         self.key = None
         self.iv = None
-        self.reader1 = None
-        self.writer1 = None
-        self.reader2 = None
-        self.writer2 = None
+        self.reader1 = self.writer1 = None
+        self.reader2 = self.writer2 = None
         self.alive = False
         self.task = None
-        self.reconnect_attempts = 0
-        self.last_heartbeat = time.time()
-        self.keepalive_task = None
 
     def start(self):
-        if self.task is None or self.task.done():
-            self.task = asyncio.run_coroutine_threadsafe(self._run_with_keepalive(), _loop)
-
-    async def _keep_alive(self):
-        while self.alive:
-            try:
-                await asyncio.sleep(25)
-                if self.writer2 and not self.writer2.is_closing():
-                    heartbeat_pkt = open_room(self.key, self.iv)
-                    self.writer2.write(heartbeat_pkt)
-                    await self.writer2.drain()
-                    self.last_heartbeat = time.time()
-            except:
-                break
-
-    async def _run_with_keepalive(self):
-        while True:
-            try:
-                await self._run()
-                break
-            except:
-                self.alive = False
-                if self.keepalive_task:
-                    self.keepalive_task.cancel()
-                await asyncio.sleep(3)
-                self.reconnect_attempts += 1
-                if self.reconnect_attempts > 10:
-                    break
+        self.task = asyncio.run_coroutine_threadsafe(self._run(), _loop)
 
     async def _run(self):
-        async with aiohttp.ClientSession() as session:
-            res = await do_login(self.u, self.p, session)
-            if not res:
-                return
-            
-            auth, k, iv, ip, port, ip2, port2 = res
-            self.key, self.iv = k, iv
+        try:
+            async with aiohttp.ClientSession() as session:
+                res = await do_login(self.u, self.p, session)
+                if not res:
+                    return
+                
+                auth, k, iv, ip, port, ip2, port2 = res
+                self.key, self.iv = k, iv
 
-            self.reader1, self.writer1 = await asyncio.open_connection(ip, int(port))
-            self.writer1.write(bytes.fromhex(auth))
-            await self.writer1.drain()
-            await asyncio.sleep(0.3)
-            
-            try:
-                await asyncio.wait_for(self.reader1.read(1024), timeout=5)
-            except:
-                pass
+                self.reader1, self.writer1 = await asyncio.open_connection(ip, int(port))
+                self.writer1.write(bytes.fromhex(auth))
+                await self.writer1.drain()
+                await asyncio.sleep(0.3)
+                await self.reader1.read(1024)
 
-            self.reader2, self.writer2 = await asyncio.open_connection(ip2, int(port2))
-            self.writer2.write(bytes.fromhex(auth))
-            await self.writer2.drain()
-            await asyncio.sleep(0.2)
+                self.reader2, self.writer2 = await asyncio.open_connection(ip2, int(port2))
+                self.writer2.write(bytes.fromhex(auth))
+                await self.writer2.drain()
+                await asyncio.sleep(0.2)
 
-            self.alive = True
-            self.reconnect_attempts = 0
-            self.keepalive_task = asyncio.create_task(self._keep_alive())
+                self.alive = True
 
-            while self.alive:
-                try:
-                    data = await asyncio.wait_for(self.reader2.read(4096), timeout=60)
-                    if not data:
+                while self.alive:
+                    try:
+                        await asyncio.wait_for(self.reader1.read(4096), timeout=60)
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        self.alive = False
                         break
-                except:
-                    break
-                    
-    async def stop(self):
-        self.alive = False
-        if self.keepalive_task:
-            self.keepalive_task.cancel()
-        for writer in [self.writer1, self.writer2]:
-            if writer:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except:
-                    pass
+                        
+        except Exception:
+            pass
+        finally:
+            self.alive = False
+            for w in (self.writer1, self.writer2):
+                if w:
+                    w.close()
+                    await w.wait_closed()
+            self.reader1 = self.writer1 = self.reader2 = self.writer2 = None
 
 def load_accounts():
-    global _accounts_loaded, _clis
-    
+    global _accounts_loaded
     if _accounts_loaded:
         return len(_clis)
     
     try:
-        if not os.path.exists(accs_file):
-            print(f"⚠️ {accs_file} غير موجود", flush=True)
-            return 0
-        
         with open(accs_file, "r") as f:
             accs = json.load(f)
         
-        if not accs:
-            print("⚠️ لا توجد حسابات في الملف", flush=True)
-            return 0
-        
         for u, p in accs.items():
-            existing = any(c.u == u for c in _clis)
-            if not existing:
-                cli = AsyncCli(u, p)
-                cli.start()
-                _clis.append(cli)
-                time.sleep(0.1)
+            cli = AsyncCli(u, p)
+            cli.start()
+            _clis.append(cli)
+            time.sleep(0.5)
         
         _accounts_loaded = True
-        
-        # الرسالة الوحيدة
-        silent_print(f"\n✅ تم تشغيل كل الحسابات ({len(_clis)} حساب)", force=True)
+        print(f"✅ تم تشغيل {len(_clis)} حساب")
         return len(_clis)
         
-    except Exception as e:
-        print(f"⚠️ خطأ: {e}", flush=True)
+    except FileNotFoundError:
         return 0
 
 def get_active_bots():
@@ -566,7 +640,7 @@ def get_active_bots():
 async def masjon_spam_loop(uid, stop_event):
     total_sent = 0
     while not stop_event.is_set():
-        active = [c for c in _clis if c.alive and c.writer2 and not c.writer2.is_closing()]
+        active = [c for c in _clis if c.alive and c.writer2]
         
         if not active:
             await asyncio.sleep(1)
@@ -578,10 +652,9 @@ async def masjon_spam_loop(uid, stop_event):
             try:
                 roomPkt = open_room(client.key, client.iv)
                 spmPkt = spm_room(client.key, client.iv, uid)
-                if client.writer2 and not client.writer2.is_closing():
+                if client.writer2:
                     client.writer2.write(roomPkt)
                     await client.writer2.drain()
-                    await asyncio.sleep(0.05)
                     for _ in range(10):
                         if stop_event.is_set():
                             break
@@ -589,7 +662,7 @@ async def masjon_spam_loop(uid, stop_event):
                         await client.writer2.drain()
                         total_sent += 1
                         await asyncio.sleep(0.05)
-            except:
+            except Exception:
                 pass
         
         await asyncio.sleep(0.3)
@@ -602,7 +675,7 @@ def start_masjon(uid):
     stop = asyncio.Event()
     task = asyncio.run_coroutine_threadsafe(masjon_spam_loop(uid, stop), _loop)
     _masjon_tasks[uid] = (task, stop)
-    return True, f"✅ بدأ الهجوم على {uid} بـ {len(get_active_bots())} بوت"
+    return True, f"✅ تم بدء الهجوم على {uid}"
 
 def stop_masjon(uid):
     if uid not in _masjon_tasks:
@@ -610,13 +683,7 @@ def stop_masjon(uid):
     task, stop = _masjon_tasks.pop(uid)
     stop.set()
     task.cancel()
-    return True, f"🛑 تم إيقاف الهجوم"
-
-def stop_all_masjon():
-    targets = list(_masjon_tasks.keys())
-    for uid in targets:
-        stop_masjon(uid)
-    return len(targets)
+    return True, f"🛑 تم إيقاف الهجوم على {uid}"
 
 def get_masjon_tasks():
     return list(_masjon_tasks.keys())
@@ -629,21 +696,33 @@ def get_masjon_tasks():
 def home():
     return jsonify({
         "status": "running",
-        "message": "MASJON BOT API",
+        "message": "MASJON BOT API - All accounts connected",
         "accounts_loaded": _accounts_loaded,
         "total_accounts": len(_clis),
-        "active_accounts": len(get_active_bots())
+        "active_accounts": len(get_active_bots()),
+        "endpoints": {
+            "/stats": "GET - حالة النظام",
+            "/masjon/start?uid=123": "GET - بدء هجوم",
+            "/masjon/stop?uid=123": "GET - إيقاف هجوم",
+            "/masjon/list": "GET - قائمة الهجمات",
+            "/friend/add?uid=123": "GET - إضافة صديق",
+            "/friend/remove?uid=123": "GET - حذف صديق",
+            "/friend/list": "GET - قائمة الأصدقاء",
+            "/jwt/update": "GET - تحديث JWT"
+        }
     })
 
 @app.route('/stats', methods=['GET'])
 def stats():
     return jsonify({
         "accounts_loaded": _accounts_loaded,
-        "total_bots": len(_clis),
         "active_bots": len(get_active_bots()),
-        "inactive_bots": len(_clis) - len(get_active_bots()),
+        "total_bots": len(_clis),
         "active_masjon": len(_masjon_tasks),
-        "masjon_targets": get_masjon_tasks()
+        "active_friends": len(get_all_active_friends()),
+        "has_jwt": get_jwt_token() is not None,
+        "masjon_targets": get_masjon_tasks(),
+        "friends": get_all_active_friends()
     })
 
 @app.route('/masjon/start', methods=['GET'])
@@ -651,9 +730,6 @@ def masjon_start():
     uid = request.args.get('uid', '')
     if not uid or not uid.isdigit():
         return jsonify({"success": False, "message": "UID غير صالح"})
-    
-    if not _accounts_loaded or len(get_active_bots()) == 0:
-        return jsonify({"success": False, "message": "❌ لا توجد بوتات نشطة"})
     
     success, message = start_masjon(uid)
     return jsonify({"success": success, "message": message})
@@ -663,70 +739,92 @@ def masjon_stop():
     uid = request.args.get('uid', '')
     if not uid:
         return jsonify({"success": False, "message": "UID مطلوب"})
+    
     success, message = stop_masjon(uid)
     return jsonify({"success": success, "message": message})
 
-@app.route('/masjon/stopall', methods=['GET'])
-def masjon_stop_all():
-    count = stop_all_masjon()
-    return jsonify({"success": True, "message": f"🛑 تم إيقاف {count} هجوم"})
-
 @app.route('/masjon/list', methods=['GET'])
 def masjon_list():
-    return jsonify({"targets": get_masjon_tasks(), "count": len(get_masjon_tasks())})
+    return jsonify({"targets": get_masjon_tasks()})
+
+@app.route('/friend/add', methods=['GET'])
+def friend_add():
+    uid = request.args.get('uid', '')
+    if not uid or not uid.isdigit():
+        return jsonify({"success": False, "message": "UID غير صالح"})
+    
+    existing = [f for f in get_all_active_friends() if f['uid'] == uid]
+    if existing:
+        return jsonify({"success": False, "message": f"الصديق {uid} موجود"})
+    
+    result = request_add_friend(uid)
+    
+    if result is True:
+        save_temp_friend(uid)
+        return jsonify({"success": True, "message": f"✅ تم إضافة {uid}"})
+    else:
+        return jsonify({"success": False, "message": result})
+
+@app.route('/friend/remove', methods=['GET'])
+def friend_remove():
+    uid = request.args.get('uid', '')
+    if not uid or not uid.isdigit():
+        return jsonify({"success": False, "message": "UID غير صالح"})
+    
+    result = remove_friend(uid)
+    
+    if result is True:
+        try:
+            with open(users_file, "r") as f:
+                data = json.load(f)
+            data["friends"] = [f for f in data.get("friends", []) if f["uid"] != uid]
+            with open(users_file, "w") as f:
+                json.dump(data, f, indent=4)
+        except:
+            pass
+        return jsonify({"success": True, "message": f"✅ تم حذف {uid}"})
+    else:
+        return jsonify({"success": False, "message": result})
+
+@app.route('/friend/list', methods=['GET'])
+def friend_list():
+    return jsonify({"friends": get_all_active_friends()})
+
+@app.route('/jwt/update', methods=['GET'])
+def jwt_update():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    token = loop.run_until_complete(extract_new_jwt())
+    loop.close()
+    
+    if token:
+        return jsonify({"success": True, "message": "✅ JWT تم تحديثه"})
+    else:
+        return jsonify({"success": False, "message": "❌ فشل التحديث"})
 
 # ========================================
-# التشغيل الرئيسي - متوافق مع Gunicorn
+# التشغيل
 # ========================================
-
-def run_forever(loop):
+def run_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-def init_system():
-    """تهيئة النظام - تُستدعى مرة واحدة"""
-    global _loop, _initialized
-    
-    if _initialized:
-        return
-    
-    print("🚀 MASJON BOT بدء التشغيل...", flush=True)
-    
-    # إنشاء حلقة asyncio جديدة
+if __name__ == '__main__':
     _loop = asyncio.new_event_loop()
-    t = threading.Thread(target=run_forever, args=(_loop,), daemon=True)
+    t = threading.Thread(target=run_loop, args=(_loop,), daemon=True)
     t.start()
     
-    # انتظار قليل
-    time.sleep(2)
+    time.sleep(1)
     
-    # تحميل الحسابات
     load_accounts()
     
-    # استخراج JWT
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(extract_new_jwt())
-        loop.close()
-    except:
-        pass
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(extract_new_jwt())
+    loop.close()
     
-    # بدء خدمات الخلفية
     start_jwt_refresh_thread()
+    auto_delete_scheduler()
     
-    _initialized = True
-    print("✅ النظام جاهز!", flush=True)
-
-# تهيئة النظام عند بدء التشغيل
-# نستخدم threading.Timer للتأكد من أن التهيئة تعمل مع Gunicorn
-def delayed_init():
-    init_system()
-
-# بدء التهيئة بعد ثانية
-threading.Timer(1, delayed_init).start()
-
-# للاختبار المحلي
-if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
