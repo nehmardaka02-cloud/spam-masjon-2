@@ -27,7 +27,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-logging.basicConfig(level=logging.ERROR)  # تغيير إلى ERROR فقط
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ----------------------------------------
 JWT_UPDATE_INTERVAL = 600
@@ -47,7 +47,7 @@ _jwt_lock = threading.Lock()
 _clis = []
 _masjon_tasks = {}
 _loop = None
-_accounts_loaded = False
+_accounts_loaded = False  # متغير لتتبع تحميل الحسابات
 
 # ========================================
 # دوال JWT
@@ -78,9 +78,12 @@ async def extract_new_jwt():
     global _current_jwt_token
     
     try:
+        print(f"🔄 جاري استخراج JWT...")
+        
         async with aiohttp.ClientSession() as session:
             at, oid = await g_access(TEMP_UID, TEMP_PASSWORD, session)
             if not at:
+                print("❌ فشل access_token")
                 return None
             
             dT = bytes.fromhex('1a13323032352d31312d32362030313a35313a3238220966726565206669726528013a07312e3132302e31'
@@ -114,6 +117,7 @@ async def extract_new_jwt():
             
             raw = await major_login(pyl, session)
             if not raw:
+                print("❌ فشل MajorLogin")
                 return None
             
             d = json.loads(decode_packet(raw.hex()))
@@ -123,9 +127,11 @@ async def extract_new_jwt():
                 with _jwt_lock:
                     _current_jwt_token = jwt_token
                 save_jwt_to_cache(jwt_token)
+                print(f"✅ JWT تم استخراجه")
                 return jwt_token
             return None
     except Exception as e:
+        print(f"❌ خطأ: {e}")
         return None
 
 def get_jwt_token():
@@ -148,6 +154,7 @@ def get_jwt_token():
 
 def refresh_jwt_if_needed(response_status, force=False):
     if force or response_status == 401:
+        print("🔄 تحديث JWT...")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         new_token = loop.run_until_complete(extract_new_jwt())
@@ -159,6 +166,7 @@ def start_jwt_refresh_thread():
     def refresh_loop():
         while True:
             time.sleep(JWT_UPDATE_INTERVAL)
+            print("🔄 تحديث دوري JWT...")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(extract_new_jwt())
@@ -535,6 +543,7 @@ def delete_expired_friends():
         for friend in data.get("friends", []):
             if current_time >= friend["expiry_timestamp"]:
                 remove_friend(friend["uid"])
+                print(f"🗑️ تم حذف {friend['uid']}")
             else:
                 active_friends.append(friend)
         
@@ -571,10 +580,12 @@ class AsyncCli:
         self.task = asyncio.run_coroutine_threadsafe(self._run(), _loop)
 
     async def _run(self):
+        # محاولة اتصال واحدة فقط
         try:
             async with aiohttp.ClientSession() as session:
                 res = await do_login(self.u, self.p, session)
                 if not res:
+                    print(f'❌ {self.u} فشل الاتصال')
                     return
                 
                 auth, k, iv, ip, port, ip2, port2 = res
@@ -592,18 +603,21 @@ class AsyncCli:
                 await asyncio.sleep(0.2)
 
                 self.alive = True
+                print(f'✅ {self.u} connected')
 
+                # الحفاظ على الاتصال مفتوحاً دون إعادة تشغيل
                 while self.alive:
                     try:
                         await asyncio.wait_for(self.reader1.read(4096), timeout=60)
                     except asyncio.TimeoutError:
                         continue
-                    except Exception:
+                    except Exception as e:
+                        print(f'⚠️ {self.u}: {e}')
                         self.alive = False
                         break
                         
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'❌ {self.u}: {e}')
         finally:
             self.alive = False
             for w in (self.writer1, self.writer2):
@@ -615,23 +629,28 @@ class AsyncCli:
 def load_accounts():
     global _accounts_loaded
     if _accounts_loaded:
+        print("⚠️ الحسابات تم تحميلها مسبقاً")
         return len(_clis)
     
     try:
         with open(accs_file, "r") as f:
             accs = json.load(f)
         
+        print(f"\n🚀 جاري تحميل {len(accs)} حساب...")
+        
         for u, p in accs.items():
             cli = AsyncCli(u, p)
             cli.start()
             _clis.append(cli)
-            time.sleep(0.5)
+            time.sleep(0.5)  # تأخير بسيط بين الاتصالات
         
         _accounts_loaded = True
-        print(f"✅ تم تشغيل {len(_clis)} حساب")
+        print(f"\n🎉 تم تشغيل جميع الحسابات بنجاح! ({len(_clis)} حساب)")
+        print("💎 الحسابات جاهزة للهجوم عند الطلب\n")
         return len(_clis)
         
     except FileNotFoundError:
+        print("⚠️ accs.json غير موجود")
         return 0
 
 def get_active_bots():
@@ -662,8 +681,8 @@ async def masjon_spam_loop(uid, stop_event):
                         await client.writer2.drain()
                         total_sent += 1
                         await asyncio.sleep(0.05)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'MASJON error: {e}')
         
         await asyncio.sleep(0.3)
     
@@ -810,14 +829,23 @@ def run_loop(loop):
     loop.run_forever()
 
 if __name__ == '__main__':
+    print("""
+╔══════════════════════════════════════════════════════════╗
+║              MASJON BOT - API JSON                       ║
+║         تحميل الحسابات مرة واحدة فقط                     ║
+╚══════════════════════════════════════════════════════════╝
+    """)
+    
     _loop = asyncio.new_event_loop()
     t = threading.Thread(target=run_loop, args=(_loop,), daemon=True)
     t.start()
     
     time.sleep(1)
     
+    # تحميل الحسابات مرة واحدة فقط
     load_accounts()
     
+    print("🔄 جاري استخراج JWT...")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(extract_new_jwt())
@@ -825,6 +853,10 @@ if __name__ == '__main__':
     
     start_jwt_refresh_thread()
     auto_delete_scheduler()
+    
+    print(f"\n✅ النظام جاهز! {len(_clis)} حساب متصل")
+    print("\n🌐 API يعمل على: http://0.0.0.0:5000/")
+    print("\n📌 انتظر الأوامر لبدء الهجوم...\n")
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
