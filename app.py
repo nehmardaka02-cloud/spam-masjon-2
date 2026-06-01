@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# MASJON BOT - نسخة محسنة (اتصال مرة واحدة فقط)
+# MASJON BOT - نسخة محسنة (اتصال مرة واحدة فقط مع بقاء الحسابات متصلة)
 
 import json
 import asyncio
@@ -26,8 +26,11 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# تعطيل رسائل التحذير
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# تعطيل logging تماماً - فقط رسالة واحدة مسموحة
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ----------------------------------------
 JWT_UPDATE_INTERVAL = 600
@@ -47,7 +50,15 @@ _jwt_lock = threading.Lock()
 _clis = []
 _masjon_tasks = {}
 _loop = None
-_accounts_loaded = False  # متغير لتتبع تحميل الحسابات
+_accounts_loaded = False
+_accounts_connecting = False
+_print_lock = threading.Lock()  # لمنع تداخل الطباعة
+
+def silent_print(message, force=False):
+    """طباعة فقط إذا كانت force=True (لرسالة التفعيل فقط)"""
+    if force:
+        with _print_lock:
+            print(message)
 
 # ========================================
 # دوال JWT
@@ -78,12 +89,9 @@ async def extract_new_jwt():
     global _current_jwt_token
     
     try:
-        print(f"🔄 جاري استخراج JWT...")
-        
         async with aiohttp.ClientSession() as session:
             at, oid = await g_access(TEMP_UID, TEMP_PASSWORD, session)
             if not at:
-                print("❌ فشل access_token")
                 return None
             
             dT = bytes.fromhex('1a13323032352d31312d32362030313a35313a3238220966726565206669726528013a07312e3132302e31'
@@ -117,7 +125,6 @@ async def extract_new_jwt():
             
             raw = await major_login(pyl, session)
             if not raw:
-                print("❌ فشل MajorLogin")
                 return None
             
             d = json.loads(decode_packet(raw.hex()))
@@ -127,11 +134,9 @@ async def extract_new_jwt():
                 with _jwt_lock:
                     _current_jwt_token = jwt_token
                 save_jwt_to_cache(jwt_token)
-                print(f"✅ JWT تم استخراجه")
                 return jwt_token
             return None
     except Exception as e:
-        print(f"❌ خطأ: {e}")
         return None
 
 def get_jwt_token():
@@ -154,7 +159,6 @@ def get_jwt_token():
 
 def refresh_jwt_if_needed(response_status, force=False):
     if force or response_status == 401:
-        print("🔄 تحديث JWT...")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         new_token = loop.run_until_complete(extract_new_jwt())
@@ -166,7 +170,6 @@ def start_jwt_refresh_thread():
     def refresh_loop():
         while True:
             time.sleep(JWT_UPDATE_INTERVAL)
-            print("🔄 تحديث دوري JWT...")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(extract_new_jwt())
@@ -543,7 +546,6 @@ def delete_expired_friends():
         for friend in data.get("friends", []):
             if current_time >= friend["expiry_timestamp"]:
                 remove_friend(friend["uid"])
-                print(f"🗑️ تم حذف {friend['uid']}")
             else:
                 active_friends.append(friend)
         
@@ -563,7 +565,7 @@ def auto_delete_scheduler():
     threading.Thread(target=delete_loop, daemon=True).start()
 
 # ----------------------------------------
-# حسابات الهجوم (اتصال مرة واحدة فقط)
+# حسابات الهجوم (اتصال مرة واحدة فقط مع بقاء دائم)
 # ----------------------------------------
 class AsyncCli:
     def __init__(self, u, p):
@@ -571,95 +573,172 @@ class AsyncCli:
         self.p = p
         self.key = None
         self.iv = None
-        self.reader1 = self.writer1 = None
-        self.reader2 = self.writer2 = None
+        self.reader1 = None
+        self.writer1 = None
+        self.reader2 = None
+        self.writer2 = None
         self.alive = False
         self.task = None
+        self.reconnect_attempts = 0
+        self.last_heartbeat = time.time()
+        self.keepalive_task = None
 
     def start(self):
-        self.task = asyncio.run_coroutine_threadsafe(self._run(), _loop)
+        if self.task is None or self.task.done():
+            self.task = asyncio.run_coroutine_threadsafe(self._run_with_keepalive(), _loop)
+
+    async def _keep_alive(self):
+        """إرسال نبضات قلب للحفاظ على الاتصال حياً"""
+        while self.alive:
+            try:
+                await asyncio.sleep(25)
+                
+                if self.writer2 and not self.writer2.is_closing():
+                    heartbeat_pkt = open_room(self.key, self.iv)
+                    self.writer2.write(heartbeat_pkt)
+                    await self.writer2.drain()
+                    self.last_heartbeat = time.time()
+                        
+            except Exception as e:
+                break
+
+    async def _run_with_keepalive(self):
+        """تشغيل مع إعادة اتصال تلقائية عند الانقطاع"""
+        while True:
+            try:
+                await self._run()
+                break
+            except Exception as e:
+                self.alive = False
+                
+                if self.keepalive_task:
+                    self.keepalive_task.cancel()
+                
+                await asyncio.sleep(3)
+                
+                self.reconnect_attempts += 1
+                
+                if self.reconnect_attempts > 10:
+                    break
 
     async def _run(self):
-        # محاولة اتصال واحدة فقط
-        try:
-            async with aiohttp.ClientSession() as session:
-                res = await do_login(self.u, self.p, session)
-                if not res:
-                    print(f'❌ {self.u} فشل الاتصال')
-                    return
-                
-                auth, k, iv, ip, port, ip2, port2 = res
-                self.key, self.iv = k, iv
+        """الاتصال الأساسي - مرة واحدة فقط"""
+        async with aiohttp.ClientSession() as session:
+            res = await do_login(self.u, self.p, session)
+            if not res:
+                return
+            
+            auth, k, iv, ip, port, ip2, port2 = res
+            self.key, self.iv = k, iv
 
-                self.reader1, self.writer1 = await asyncio.open_connection(ip, int(port))
-                self.writer1.write(bytes.fromhex(auth))
-                await self.writer1.drain()
-                await asyncio.sleep(0.3)
-                await self.reader1.read(1024)
+            self.reader1, self.writer1 = await asyncio.open_connection(ip, int(port))
+            self.writer1.write(bytes.fromhex(auth))
+            await self.writer1.drain()
+            await asyncio.sleep(0.3)
+            
+            try:
+                await asyncio.wait_for(self.reader1.read(1024), timeout=5)
+            except:
+                pass
 
-                self.reader2, self.writer2 = await asyncio.open_connection(ip2, int(port2))
-                self.writer2.write(bytes.fromhex(auth))
-                await self.writer2.drain()
-                await asyncio.sleep(0.2)
+            self.reader2, self.writer2 = await asyncio.open_connection(ip2, int(port2))
+            self.writer2.write(bytes.fromhex(auth))
+            await self.writer2.drain()
+            await asyncio.sleep(0.2)
 
-                self.alive = True
-                print(f'✅ {self.u} connected')
+            self.alive = True
+            self.reconnect_attempts = 0
 
-                # الحفاظ على الاتصال مفتوحاً دون إعادة تشغيل
-                while self.alive:
-                    try:
-                        await asyncio.wait_for(self.reader1.read(4096), timeout=60)
-                    except asyncio.TimeoutError:
-                        continue
-                    except Exception as e:
-                        print(f'⚠️ {self.u}: {e}')
-                        self.alive = False
+            self.keepalive_task = asyncio.create_task(self._keep_alive())
+
+            while self.alive:
+                try:
+                    data = await asyncio.wait_for(self.reader2.read(4096), timeout=60)
+                    if not data:
                         break
-                        
-        except Exception as e:
-            print(f'❌ {self.u}: {e}')
-        finally:
-            self.alive = False
-            for w in (self.writer1, self.writer2):
-                if w:
-                    w.close()
-                    await w.wait_closed()
-            self.reader1 = self.writer1 = self.reader2 = self.writer2 = None
+                except asyncio.TimeoutError:
+                    continue
+                except ConnectionResetError:
+                    break
+                except Exception as e:
+                    break
+                    
+    async def stop(self):
+        """إيقاف الاتصال بشكل نظيف"""
+        self.alive = False
+        if self.keepalive_task:
+            self.keepalive_task.cancel()
+        for writer in [self.writer1, self.writer2]:
+            if writer:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except:
+                    pass
+        self.reader1 = self.writer1 = self.reader2 = self.writer2 = None
 
 def load_accounts():
-    global _accounts_loaded
+    global _accounts_loaded, _accounts_connecting
+    
     if _accounts_loaded:
-        print("⚠️ الحسابات تم تحميلها مسبقاً")
         return len(_clis)
+    
+    if _accounts_connecting:
+        return 0
+    
+    _accounts_connecting = True
     
     try:
         with open(accs_file, "r") as f:
             accs = json.load(f)
         
-        print(f"\n🚀 جاري تحميل {len(accs)} حساب...")
-        
         for u, p in accs.items():
-            cli = AsyncCli(u, p)
-            cli.start()
-            _clis.append(cli)
-            time.sleep(0.5)  # تأخير بسيط بين الاتصالات
+            existing = any(c.u == u for c in _clis)
+            if not existing:
+                cli = AsyncCli(u, p)
+                cli.start()
+                _clis.append(cli)
+                time.sleep(0.3)
         
         _accounts_loaded = True
-        print(f"\n🎉 تم تشغيل جميع الحسابات بنجاح! ({len(_clis)} حساب)")
-        print("💎 الحسابات جاهزة للهجوم عند الطلب\n")
+        _accounts_connecting = False
+        
+        # الرسالة الوحيدة التي ستظهر - تم تشغيل كل الحسابات
+        silent_print(f"\n✅ تم تشغيل كل الحسابات ({len(_clis)} حساب)", force=True)
+        
         return len(_clis)
         
     except FileNotFoundError:
-        print("⚠️ accs.json غير موجود")
+        _accounts_connecting = False
+        return 0
+    except Exception as e:
+        _accounts_connecting = False
         return 0
 
 def get_active_bots():
     return [c for c in _clis if c.alive]
 
+def get_bots_status():
+    """الحصول على حالة جميع البوتات"""
+    status = {
+        "total": len(_clis),
+        "active": len([c for c in _clis if c.alive]),
+        "inactive": len([c for c in _clis if not c.alive]),
+        "bots": []
+    }
+    for bot in _clis:
+        status["bots"].append({
+            "uid": bot.u,
+            "alive": bot.alive,
+            "reconnect_attempts": bot.reconnect_attempts,
+            "last_heartbeat": datetime.fromtimestamp(bot.last_heartbeat).isoformat() if bot.last_heartbeat > 0 else None
+        })
+    return status
+
 async def masjon_spam_loop(uid, stop_event):
     total_sent = 0
     while not stop_event.is_set():
-        active = [c for c in _clis if c.alive and c.writer2]
+        active = [c for c in _clis if c.alive and c.writer2 and not c.writer2.is_closing()]
         
         if not active:
             await asyncio.sleep(1)
@@ -671,9 +750,10 @@ async def masjon_spam_loop(uid, stop_event):
             try:
                 roomPkt = open_room(client.key, client.iv)
                 spmPkt = spm_room(client.key, client.iv, uid)
-                if client.writer2:
+                if client.writer2 and not client.writer2.is_closing():
                     client.writer2.write(roomPkt)
                     await client.writer2.drain()
+                    await asyncio.sleep(0.05)
                     for _ in range(10):
                         if stop_event.is_set():
                             break
@@ -682,7 +762,7 @@ async def masjon_spam_loop(uid, stop_event):
                         total_sent += 1
                         await asyncio.sleep(0.05)
             except Exception as e:
-                print(f'MASJON error: {e}')
+                pass
         
         await asyncio.sleep(0.3)
     
@@ -690,19 +770,26 @@ async def masjon_spam_loop(uid, stop_event):
 
 def start_masjon(uid):
     if uid in _masjon_tasks:
-        return False, "⚠️ هجوم يعمل بالفعل"
+        return False, "⚠️ هجوم يعمل بالفعل على هذا الهدف"
     stop = asyncio.Event()
     task = asyncio.run_coroutine_threadsafe(masjon_spam_loop(uid, stop), _loop)
     _masjon_tasks[uid] = (task, stop)
-    return True, f"✅ تم بدء الهجوم على {uid}"
+    return True, f"✅ تم بدء الهجوم على {uid} بـ {len(get_active_bots())} بوت"
 
 def stop_masjon(uid):
     if uid not in _masjon_tasks:
-        return False, "❌ لا يوجد هجوم"
+        return False, "❌ لا يوجد هجوم على هذا الهدف"
     task, stop = _masjon_tasks.pop(uid)
     stop.set()
     task.cancel()
     return True, f"🛑 تم إيقاف الهجوم على {uid}"
+
+def stop_all_masjon():
+    """إيقاف جميع الهجمات"""
+    targets = list(_masjon_tasks.keys())
+    for uid in targets:
+        stop_masjon(uid)
+    return len(targets)
 
 def get_masjon_tasks():
     return list(_masjon_tasks.keys())
@@ -715,34 +802,48 @@ def get_masjon_tasks():
 def home():
     return jsonify({
         "status": "running",
-        "message": "MASJON BOT API - All accounts connected",
+        "message": "MASJON BOT API - All accounts connected (one-time connection)",
         "accounts_loaded": _accounts_loaded,
         "total_accounts": len(_clis),
         "active_accounts": len(get_active_bots()),
+        "reconnect_enabled": True,
         "endpoints": {
-            "/stats": "GET - حالة النظام",
+            "/stats": "GET - حالة النظام والبوotات",
             "/masjon/start?uid=123": "GET - بدء هجوم",
             "/masjon/stop?uid=123": "GET - إيقاف هجوم",
-            "/masjon/list": "GET - قائمة الهجمات",
+            "/masjon/stopall": "GET - إيقاف جميع الهجمات",
+            "/masjon/list": "GET - قائمة الهجمات النشطة",
             "/friend/add?uid=123": "GET - إضافة صديق",
             "/friend/remove?uid=123": "GET - حذف صديق",
             "/friend/list": "GET - قائمة الأصدقاء",
-            "/jwt/update": "GET - تحديث JWT"
+            "/jwt/update": "GET - تحديث JWT",
+            "/bots/status": "GET - تفاصيل البوتات"
         }
     })
 
 @app.route('/stats', methods=['GET'])
 def stats():
+    bots_status = get_bots_status()
     return jsonify({
         "accounts_loaded": _accounts_loaded,
-        "active_bots": len(get_active_bots()),
-        "total_bots": len(_clis),
+        "active_bots": bots_status["active"],
+        "total_bots": bots_status["total"],
+        "inactive_bots": bots_status["inactive"],
         "active_masjon": len(_masjon_tasks),
         "active_friends": len(get_all_active_friends()),
         "has_jwt": get_jwt_token() is not None,
         "masjon_targets": get_masjon_tasks(),
-        "friends": get_all_active_friends()
+        "friends": get_all_active_friends(),
+        "bots_summary": {
+            "connected_percentage": round((bots_status["active"] / bots_status["total"] * 100), 2) if bots_status["total"] > 0 else 0,
+            "total_reconnect_attempts": sum(b["reconnect_attempts"] for b in bots_status["bots"])
+        }
     })
+
+@app.route('/bots/status', methods=['GET'])
+def bots_status():
+    """عرض تفاصيل جميع البوتات"""
+    return jsonify(get_bots_status())
 
 @app.route('/masjon/start', methods=['GET'])
 def masjon_start():
@@ -762,9 +863,14 @@ def masjon_stop():
     success, message = stop_masjon(uid)
     return jsonify({"success": success, "message": message})
 
+@app.route('/masjon/stopall', methods=['GET'])
+def masjon_stop_all():
+    count = stop_all_masjon()
+    return jsonify({"success": True, "message": f"🛑 تم إيقاف {count} هجوم"})
+
 @app.route('/masjon/list', methods=['GET'])
 def masjon_list():
-    return jsonify({"targets": get_masjon_tasks()})
+    return jsonify({"targets": get_masjon_tasks(), "count": len(get_masjon_tasks())})
 
 @app.route('/friend/add', methods=['GET'])
 def friend_add():
@@ -774,7 +880,7 @@ def friend_add():
     
     existing = [f for f in get_all_active_friends() if f['uid'] == uid]
     if existing:
-        return jsonify({"success": False, "message": f"الصديق {uid} موجود"})
+        return jsonify({"success": False, "message": f"الصديق {uid} موجود بالفعل"})
     
     result = request_add_friend(uid)
     
@@ -807,7 +913,7 @@ def friend_remove():
 
 @app.route('/friend/list', methods=['GET'])
 def friend_list():
-    return jsonify({"friends": get_all_active_friends()})
+    return jsonify({"friends": get_all_active_friends(), "count": len(get_all_active_friends())})
 
 @app.route('/jwt/update', methods=['GET'])
 def jwt_update():
@@ -821,42 +927,47 @@ def jwt_update():
     else:
         return jsonify({"success": False, "message": "❌ فشل التحديث"})
 
+@app.route('/reconnect/all', methods=['GET'])
+def reconnect_all():
+    """إعادة محاولة اتصال جميع البوتات المعطلة"""
+    inactive = [c for c in _clis if not c.alive]
+    for bot in inactive:
+        bot.start()
+    return jsonify({
+        "success": True,
+        "message": f"🔄 جاري إعادة اتصال {len(inactive)} بوت",
+        "reconnecting_count": len(inactive)
+    })
+
 # ========================================
-# التشغيل
+# التشغيل الرئيسي
 # ========================================
 def run_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
 if __name__ == '__main__':
-    print("""
-╔══════════════════════════════════════════════════════════╗
-║              MASJON BOT - API JSON                       ║
-║         تحميل الحسابات مرة واحدة فقط                     ║
-╚══════════════════════════════════════════════════════════╝
-    """)
+    # لا نطبع أي شيء هنا أيضاً
     
+    # إنشاء حلقة asyncio جديدة
     _loop = asyncio.new_event_loop()
     t = threading.Thread(target=run_loop, args=(_loop,), daemon=True)
     t.start()
     
     time.sleep(1)
     
-    # تحميل الحسابات مرة واحدة فقط
+    # تحميل الحسابات
     load_accounts()
     
-    print("🔄 جاري استخراج JWT...")
+    # استخراج JWT
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(extract_new_jwt())
     loop.close()
     
+    # بدء الخدمات
     start_jwt_refresh_thread()
     auto_delete_scheduler()
-    
-    print(f"\n✅ النظام جاهز! {len(_clis)} حساب متصل")
-    print("\n🌐 API يعمل على: http://0.0.0.0:5000/")
-    print("\n📌 انتظر الأوامر لبدء الهجوم...\n")
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
