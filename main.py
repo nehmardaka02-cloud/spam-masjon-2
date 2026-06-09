@@ -709,9 +709,11 @@ def load_accounts():
         return len(_clis)
         
     except FileNotFoundError:
+        silent_print(f"\n❌ ملف {accs_file} غير موجود", force=True)
         _accounts_connecting = False
         return 0
     except Exception as e:
+        silent_print(f"\n❌ خطأ في تحميل الحسابات: {e}", force=True)
         _accounts_connecting = False
         return 0
 
@@ -947,8 +949,6 @@ def run_loop(loop):
     loop.run_forever()
 
 if __name__ == '__main__':
-    # لا نطبع أي شيء هنا أيضاً
-    
     # إنشاء حلقة asyncio جديدة
     _loop = asyncio.new_event_loop()
     t = threading.Thread(target=run_loop, args=(_loop,), daemon=True)
@@ -956,7 +956,7 @@ if __name__ == '__main__':
     
     time.sleep(1)
     
-    # تحميل الحسابات
+    # تحميل وتشغيل جميع الحسابات من accs.json
     load_accounts()
     
     # استخراج JWT
